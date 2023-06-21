@@ -45,6 +45,10 @@ type (
 		// 删除被观察对象.
 		Del(path string) File
 
+		// Has
+		// 是否已注册.
+		Has(path string) (exists bool)
+
 		// SetDuration
 		// 设置观察频率.
 		SetDuration(duration time.Duration) File
@@ -104,6 +108,15 @@ func (o *file) Del(path string) File {
 	}
 
 	return o
+}
+
+// Has
+// 是否已注册.
+func (o *file) Has(path string) (exists bool) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	_, exists = o.registries[path]
+	return
 }
 
 // SetDuration
