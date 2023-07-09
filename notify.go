@@ -16,9 +16,39 @@
 package watcher
 
 type (
+	// Notification
+	// 通知结构.
+	Notification struct {
+		// 文件内容.
+		Body []byte
+
+		// 错误原因.
+		Err error
+
+		// 文件路径.
+		Path string
+
+		// 通知类型.
+		Type NotifierType
+	}
+
 	// Notifier
 	// 通知回调.
 	//
 	// 当目标(被观察)对象发生变更后, 触发此回调.
-	Notifier func(path string, body []byte, err error)
+	Notifier func(notification Notification)
+
+	// NotifierType
+	// 通知类型.
+	NotifierType int
+)
+
+const (
+	_ NotifierType = iota
+
+	NotChanged
+	NotFound
+	StatFailed
+	ReadFailed
+	ReadSuccess
 )

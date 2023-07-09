@@ -19,268 +19,264 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"sync"
 	"time"
 )
 
-const (
-	// 检测频率.
-	// 默认每隔3秒检查一次文件是否发生变更.
-	defaultFileDuration = time.Second * 3
+var (
+	emptyTime = time.Unix(0, 0)
 )
 
-var (
-	errFileIsDirectory = fmt.Errorf("specifed path is directory")
+const (
+	defaultFileTicker = time.Second * 3
 )
 
 type (
-	// File
+	// FileWatcher
 	// 文件观察.
-	File interface {
+	FileWatcher interface {
 		// Add
-		// 添加观察对象.
-		Add(path string, notifies ...Notifier) File
+		// 添加文件.
+		Add(paths ...string) (err error)
 
-		// Del
-		// 删除被观察对象.
-		Del(path string) File
+		// AddDir
+		// 添加目录.
+		AddDir(paths ...string) (err error)
 
-		// Has
-		// 是否已注册.
-		Has(path string) (exists bool)
-
-		// SetDuration
-		// 设置观察频率.
-		SetDuration(duration time.Duration) File
-
-		// Start
-		// 启动观察.
-		Start(ctx context.Context)
-
-		// Stop
-		// 退出观察
+		Start(ctx context.Context) (err error)
 		Stop()
+
+		WithFilter(filter *regexp.Regexp) FileWatcher
+		WithNotifier(notifier Notifier) FileWatcher
 	}
 
-	// 文件结构体.
-	file struct {
-		cancel            context.CancelFunc
-		ctx               context.Context
-		duration          time.Duration
-		modifies          map[string]time.Time
-		mu                sync.RWMutex
-		registries        map[string][]Notifier
-		started, scanning bool
+	fw struct {
+		cancel   context.CancelFunc
+		ctx      context.Context
+		dirs     []string
+		files    map[string]int64
+		filter   *regexp.Regexp
+		mu       *sync.RWMutex
+		notifier Notifier
 	}
 )
 
-// NewFile
-// 创建文件观察器.
-func NewFile() File {
-	return (&file{
-		duration: defaultFileDuration,
-	}).init()
-}
-
-// Add
-// 添加观察对象.
-func (o *file) Add(path string, notifies ...Notifier) File {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	if _, ok := o.registries[path]; !ok {
-		o.registries[path] = make([]Notifier, 0)
+func NewFile() FileWatcher {
+	return &fw{
+		dirs:  make([]string, 0),
+		files: make(map[string]int64),
+		mu:    &sync.RWMutex{},
 	}
-
-	o.registries[path] = append(o.registries[path], notifies...)
-	return o
 }
 
-// Del
-// 删除被观察对象.
-func (o *file) Del(path string) File {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	if _, ok := o.registries[path]; ok {
-		delete(o.modifies, path)
-		delete(o.registries, path)
+func (o *fw) Add(paths ...string) (err error) {
+	for _, path := range paths {
+		if err = o.addFile(path); err != nil {
+			return err
+		}
 	}
-
-	return o
-}
-
-// Has
-// 是否已注册.
-func (o *file) Has(path string) (exists bool) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	_, exists = o.registries[path]
 	return
 }
 
-// SetDuration
-// 设置观察频率.
-func (o *file) SetDuration(duration time.Duration) File {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.duration = duration
-	return o
+func (o *fw) AddDir(paths ...string) (err error) {
+	for _, path := range paths {
+		if err = o.scan(path); err != nil {
+			return
+		}
+	}
+	return
 }
 
-// Start
-// 启动观察.
-func (o *file) Start(ctx context.Context) {
+func (o *fw) Start(ctx context.Context) (err error) {
 	o.mu.Lock()
 
 	// 1. 重复启动.
-	if o.started {
+	if o.ctx != nil && o.ctx.Err() == nil {
 		o.mu.Unlock()
 		return
 	}
 
-	// 2. 启动过程.
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
+	// 2. 锁定状态.
 	o.ctx, o.cancel = context.WithCancel(ctx)
-	o.started = true
 	o.mu.Unlock()
 
-	// 3. 监听退出.
-	//    当服务退出时, 恢复初始状态.
+	// 3. 恢复状态.
 	defer func() {
 		o.mu.Lock()
 		defer o.mu.Unlock()
 		o.ctx = nil
 		o.cancel = nil
-		o.started = false
-		o.scanning = false
 	}()
 
-	// 4. 立即检测.
-	o.scan()
+	// 4. 预先加载.
+	if err = o.reader(); err != nil {
+		return
+	}
 
-	// 5. 定时检测.
-	ti := time.NewTicker(o.duration)
+	// 5. 监听信号.
+	var ticker = time.NewTicker(defaultFileTicker)
+
 	for {
 		select {
-		case <-ti.C:
-			go o.scan()
-		case <-o.ctx.Done():
-			ti.Stop()
+		case <-ticker.C:
+			go func() {
+				if o.scanner() == nil {
+					_ = o.reader()
+				}
+			}()
+		case <-ctx.Done():
+			ticker.Stop()
 			return
 		}
 	}
 }
 
-// Stop
-// 退出观察
-func (o *file) Stop() {
+func (o *fw) Stop() {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
-
 	if o.ctx != nil && o.ctx.Err() == nil {
 		o.cancel()
 	}
+}
+
+func (o *fw) WithFilter(filter *regexp.Regexp) FileWatcher {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.filter = filter
+	return o
+}
+
+func (o *fw) WithNotifier(notifier Notifier) FileWatcher {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.notifier = notifier
+	return o
 }
 
 // /////////////////////////////////////////////////////////////////////////////
 // Access methods
 // /////////////////////////////////////////////////////////////////////////////
 
-// 构造实例.
-func (o *file) init() *file {
-	o.modifies = make(map[string]time.Time)
-	o.registries = make(map[string][]Notifier)
-	return o
+func (o *fw) addFile(path string) (err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	// 1. 重复添加.
+	if _, ok := o.files[path]; ok {
+		return
+	}
+
+	// 2. 加入观察.
+	o.files[path] = 0
+	return
 }
 
-// 读取文件.
-func (o *file) read(path string, notifies []Notifier) {
+func (o *fw) read(path string, ms int64) (err error) {
 	var (
-		body    []byte
-		changed = false
-		err     error
-		info    os.FileInfo
+		info os.FileInfo
+		n    = Notification{
+			Path: path,
+		}
 	)
 
-	// 1. 结束读取.
 	defer func() {
-		// 捕获异常.
-		if v := recover(); v != nil {
-			err = fmt.Errorf("%v", v)
-		}
-
-		// 读取出错.
-		if err != nil || changed {
-			for _, notifier := range notifies {
-				go notifier(path, body, err)
-			}
+		if o.notifier != nil && n.Type != NotChanged {
+			go o.notifier(n)
 		}
 	}()
 
-	// 2. 文件检测.
-	if info, err = os.Stat(path); err != nil {
-		return
-	}
-
-	// 2.1 禁止目录.
-	if info.IsDir() {
-		err = errFileIsDirectory
-		return
-	}
-
-	// 2.2 变更检测.
-	if func() bool {
-		if t, ok := o.modifies[path]; ok && t.UnixMilli() == info.ModTime().UnixMilli() {
-			return true
+	// 1. 状态检查.
+	if info, n.Err = os.Stat(path); n.Err != nil {
+		// 1.1 文件丢失.
+		if os.IsNotExist(n.Err) {
+			n.Err = nil
+			n.Type = NotFound
+			return
 		}
-		return false
-	}() {
+
+		// 1.2 检查出错.
+		n.Type = StatFailed
 		return
 	}
 
-	// 3. 读取内容.
-	body, err = os.ReadFile(path)
-	changed = true
+	// 2. 从未变更.
+	if info.ModTime().UnixMilli() == ms {
+		n.Type = NotChanged
+		return
+	}
 
-	// 3.1 记录时间.
-	o.mu.Lock()
-	o.modifies[path] = info.ModTime()
-	o.mu.Unlock()
+	// 3. 读取文件.
+	if n.Body, n.Err = os.ReadFile(path); n.Err != nil {
+		n.Type = ReadFailed
+	} else {
+		n.Type = ReadSuccess
+
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		o.files[path] = info.ModTime().UnixMilli()
+	}
+	return
 }
 
-// 扫描文件.
-func (o *file) scan() {
-	o.mu.Lock()
+func (o *fw) reader() (err error) {
+	for path, ms := range func() map[string]int64 {
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		return o.files
+	}() {
+		if err = o.read(path, ms); err != nil {
+			return
+		}
+	}
+	return
+}
 
-	if o.scanning {
-		o.mu.Unlock()
+func (o *fw) scan(path string) (err error) {
+	var ds []os.DirEntry
+
+	// 1. 读取目录.
+	if ds, err = os.ReadDir(path); err != nil {
 		return
 	}
 
-	o.scanning = true
-	o.mu.Unlock()
+	// 2. 遍历文件.
+	for _, d := range ds {
+		if d.Name() == "." || d.Name() == ".." {
+			continue
+		}
 
-	w := sync.WaitGroup{}
-	defer func() {
-		w.Wait()
-		o.mu.Lock()
-		o.scanning = false
-		o.mu.Unlock()
-	}()
+		k := fmt.Sprintf("%s/%s", path, d.Name())
 
-	for k, vs := range func() map[string][]Notifier {
+		// 2.1 目录递归.
+		if d.IsDir() {
+			if err = o.scan(k); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// 2.3 发现文件.
+		if o.filter != nil && !o.filter.MatchString(d.Name()) {
+			continue
+		}
+		if err = o.addFile(k); err != nil {
+			return
+		}
+	}
+
+	return
+}
+
+func (o *fw) scanner() (err error) {
+	for _, path := range func() []string {
 		o.mu.RLock()
 		defer o.mu.RUnlock()
-		return o.registries
+		return o.dirs
 	}() {
-		w.Add(1)
-		go func(path string, notifies []Notifier) {
-			defer w.Done()
-			o.read(path, notifies)
-		}(k, vs)
+		if err = o.scan(path); err != nil {
+			return
+		}
 	}
+	return
 }

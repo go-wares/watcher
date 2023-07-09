@@ -17,19 +17,35 @@ package watcher
 
 import (
 	"context"
-	"runtime"
+	"regexp"
 	"testing"
-	"time"
 )
 
 func TestNewFile(t *testing.T) {
 	var (
-		ctx  = context.Background()
-		obj  = NewFile()
-		call = func(path string, body []byte, err error) {
-			t.Logf("path=%s, error=%v, cpu=%d, goroutine=%d", path, err, runtime.NumCPU(), runtime.NumGoroutine())
-		}
+		ctx = context.Background()
+		obj = NewFile()
+		// call = func(path string, body []byte, err error) {
+		// 	t.Logf("path=%s, error=%v, cpu=%d, goroutine=%d", path, err, runtime.NumCPU(), runtime.NumGoroutine())
+		// }
 	)
 
-	obj.SetDuration(time.Second).Add("/tmp/a.txt", call).Add("/tmp/b.txt", call).Start(ctx)
+	src := "/Users/fuyibing/codes/gitea.jssns.com/middlewares/mqc/config"
+	obj.WithFilter(regexp.MustCompile(`\.json$`))
+	obj.WithNotifier(notifier)
+	if err := obj.AddDir(src); err != nil {
+		t.Logf("dir error = %v", err)
+		return
+	}
+
+	if err := obj.Start(ctx); err != nil {
+		t.Logf("start error = %v", err)
+		return
+	}
+
+	t.Logf("end start")
+}
+
+func notifier(notification Notification) {
+	println("notification: ", notification.Path)
 }
