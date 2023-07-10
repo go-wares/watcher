@@ -84,6 +84,10 @@ func (o *fw) AddDir(paths ...string) (err error) {
 		if err = o.scan(path); err != nil {
 			return
 		}
+
+		o.mu.Lock()
+		o.dirs = append(o.dirs, path)
+		o.mu.Unlock()
 	}
 	return
 }
@@ -192,6 +196,11 @@ func (o *fw) read(path string, ms int64) (err error) {
 		if os.IsNotExist(n.Err) {
 			n.Err = nil
 			n.Type = NotFound
+
+			o.mu.Lock()
+			delete(o.files, path)
+			o.mu.Unlock()
+
 			return
 		}
 

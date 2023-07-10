@@ -30,8 +30,8 @@ func TestNewFile(t *testing.T) {
 		// }
 	)
 
-	src := "/Users/fuyibing/codes/gitea.jssns.com/middlewares/mqc/config"
-	obj.WithFilter(regexp.MustCompile(`\.json$`))
+	src := "/Users/fuyibing/codes/gitea.jssns.com/middlewares/mqc/config/crons"
+	obj.WithFilter(regexp.MustCompile(`\.ya?ml$`))
 	obj.WithNotifier(notifier)
 	if err := obj.AddDir(src); err != nil {
 		t.Logf("dir error = %v", err)
@@ -46,6 +46,20 @@ func TestNewFile(t *testing.T) {
 	t.Logf("end start")
 }
 
-func notifier(notification Notification) {
-	println("notification: ", notification.Path)
+func notifier(x Notification) {
+	stat := "unknown"
+	switch x.Type {
+	case NotChanged:
+		stat = "NotChanged"
+	case NotFound:
+		stat = "NotFound"
+	case StatFailed:
+		stat = "StatFailed"
+	case ReadFailed:
+		stat = "ReadFailed"
+	case ReadSuccess:
+		stat = "ReadSuccess"
+	}
+
+	println("notification: ", stat, " -> ", x.Path)
 }
